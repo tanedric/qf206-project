@@ -1,0 +1,11 @@
+date,asset_id,predicted_return,model_name,feature_set_name
+2020-04-30,ADI,0.01449358707365693,elasticnet,right
+2020-04-30,AMD,0.02286033641034238,elasticnet,right
+2020-04-30,ASML,0.021493339611847767,elasticnet,right
+2020-04-30,AVGO,0.012917862552755531,elasticnet,right
+2020-04-30,INTC,0.007985111070686501,elasticnet,right
+2020-04-30,KLAC,0.01774652029150958,elasticnet,right
+2020-04-30,MU,0.022301941425303708,elasticnet,right
+2020-04-30,NVDA,0.022211116194206883,elasticnet,right
+2020-04-30,QCOM,0.015836245675790082,elasticnet,right
+2020-04-30,TXN,0.010031014912794858,elasticnet,right
