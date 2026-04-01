@@ -103,14 +103,29 @@ def _table_to_frame(table: object) -> pd.DataFrame:
     return pd.DataFrame(normalized_rows, columns=header)
 
 
-def _get_universe_from_frame(membership: pd.DataFrame, as_of_date: str | pd.Timestamp) -> list[str]:
+def _get_universe_from_frame(
+    membership: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
+    *,
+    gics_filter: str | None = None,
+) -> list[str]:
     target_date = _parse_date(as_of_date)
     start_ok = membership["start_date"].le(target_date)
     if "end_date" in membership.columns:
         end_ok = membership["end_date"].isna() | membership["end_date"].ge(target_date)
     else:
         end_ok = True
-    universe = membership.loc[start_ok & end_ok, "ticker"].dropna().astype(str).sort_values()
+    filtered = membership.loc[start_ok & end_ok].copy()
+    if gics_filter is not None:
+        gics_filter_lower = gics_filter.strip().lower()
+        sector_mask = pd.Series(False, index=filtered.index)
+        for col in ("gics_sub_industry", "gics_sector"):
+            if col in filtered.columns:
+                sector_mask |= filtered[col].astype(str).str.lower().str.contains(
+                    gics_filter_lower, na=False
+                )
+        filtered = filtered.loc[sector_mask]
+    universe = filtered["ticker"].dropna().astype(str).sort_values()
     return universe.tolist()
 
 
@@ -253,6 +268,24 @@ def build_membership_table(
     membership["end_date"] = pd.to_datetime(membership["end_date"], errors="coerce").dt.normalize()
     membership["scraped_at"] = snapshot.scraped_at
     membership["latest_effective_date_seen"] = snapshot.latest_effective_date_seen
+
+    # Join GICS sector columns from current constituents onto all membership rows.
+    # Sector classification is applied to all tickers (current and historical) using
+    # the latest available snapshot — the best approximation we have from Wikipedia.
+    sector_cols = [c for c in snapshot.current_constituents.columns
+                   if "gics" in c.lower() or "sector" in c.lower() or "industry" in c.lower()]
+    if sector_cols:
+        sector_map = snapshot.current_constituents[["ticker"] + sector_cols].copy()
+        rename = {}
+        for col in sector_cols:
+            low = col.lower()
+            if "sub" in low:
+                rename[col] = "gics_sub_industry"
+            elif "sector" in low or "gics" in low:
+                rename[col] = "gics_sector"
+        sector_map = sector_map.rename(columns=rename).drop_duplicates(subset=["ticker"])
+        membership = membership.merge(sector_map, on="ticker", how="left")
+
     membership = membership.dropna(subset=["ticker", "start_date"]).drop_duplicates(
         subset=["ticker", "start_date", "end_date"],
         keep="last",
@@ -294,9 +327,10 @@ def get_sp500_universe_for_date(
     *,
     csv_path: str | Path = DEFAULT_CSV_PATH,
     auto_update: bool = False,
+    gics_filter: str | None = None,
 ) -> list[str]:
     membership = ensure_membership_csv(csv_path=csv_path, check_for_updates=auto_update)
-    return _get_universe_from_frame(membership, as_of_date)
+    return _get_universe_from_frame(membership, as_of_date, gics_filter=gics_filter)
 
 
 def get_sp500_universe_between_dates(

@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .env
 .DS_Store
+.csv
+.png
+.pt
 
 # VS Code
 .vscode/
