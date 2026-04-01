@@ -1,0 +1,10 @@
+auto_mix_prep==0.2.0
+config==0.5.1
+matplotlib==3.10.8
+numpy==2.4.4
+pandas==3.0.2
+pyportfolioopt==1.6.0
+python-dotenv==1.2.2
+Requests==2.33.1
+scipy==1.17.1
+yfinance==1.2.0
