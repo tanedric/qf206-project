@@ -14,6 +14,7 @@ import logging, contextlib, io
 import traceback
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
+from matplotlib.patches import Patch
 import os
 import sys
 import json
@@ -61,8 +62,8 @@ MIN_HISTORY_DAYS   = 1
 ENABLE_MVO              = True
 ENABLE_BLACK_LITTERMAN  = True
 ENABLE_EQUAL_WEIGHT     = True
-ENABLE_LSTM_MVO         = True
-ENABLE_LSTM_BL          = True
+ENABLE_LSTM_MVO         = False #True
+ENABLE_LSTM_BL          = False #True
 
 # ── TRANSACTION COSTS ─────────────────────────
 ENABLE_TRANSACTION_COSTS = True
@@ -316,6 +317,25 @@ def main():
 
     returns       = prices.pct_change().replace([np.inf, -np.inf], np.nan)
     returns.index = pd.DatetimeIndex(returns.index).tz_localize(None).normalize()
+
+    benchmark_returns = pd.Series(dtype=float, name="benchmark")
+    benchmark_equity  = pd.Series(dtype=float, name="benchmark_equity")
+    try:
+        benchmark_raw = silent_download("^GSPC", START_DATE, END_DATE)
+        if not benchmark_raw.empty:
+            benchmark_prices = (
+                benchmark_raw["Adj Close"] if "Adj Close" in benchmark_raw.columns
+                else benchmark_raw["Close"]
+            )
+            if isinstance(benchmark_prices, pd.DataFrame):
+                benchmark_prices = benchmark_prices.squeeze()
+            benchmark_prices.index = pd.DatetimeIndex(benchmark_prices.index).tz_localize(None).normalize()
+            benchmark_prices = benchmark_prices.ffill()
+            benchmark_returns = benchmark_prices.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+            benchmark_equity = 100 * (1 + benchmark_returns.fillna(0.0)).cumprod()
+    except Exception:
+        benchmark_returns = pd.Series(dtype=float, name="benchmark")
+        benchmark_equity  = pd.Series(dtype=float, name="benchmark_equity")
 
     print(f"✓ Price data ready  |  {len(prices)} rows  |  universe: {all_valid_tickers}")
 
@@ -825,6 +845,14 @@ def main():
         plt.setp(ax.get_xticklabels(),
                  rotation=rotation, ha="center", fontsize=fontsize)
 
+    def yearly_xaxis(ax, rotation=0, fontsize=8):
+        """Yearly major ticks only, for dense long-span rebalance charts."""
+        ax.xaxis.set_major_locator(mdates.YearLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.grid(which="major", axis="x", alpha=0.25)
+        plt.setp(ax.get_xticklabels(),
+                 rotation=rotation, ha="center", fontsize=fontsize)
+
 
     def rebalance_xaxis(ax, dates, rotation=60, fontsize=8):
         """One tick per rebalance date; year shown only when it changes."""
@@ -890,6 +918,112 @@ def main():
             "CVaR (95%)":        cvar,
         }
 
+    def daily_risk_free_rate():
+        return (1 + RISK_FREE_RATE) ** (1 / 252) - 1
+
+    def as_signal_series(values, tickers):
+        if isinstance(values, pd.Series):
+            return values.reindex(tickers).astype(float)
+        return pd.Series(np.asarray(values, dtype=float), index=tickers, dtype=float)
+
+    def compute_sortino_ratio(daily_rets, annual_return):
+        if daily_rets.empty:
+            return np.nan
+        rf_daily = daily_risk_free_rate()
+        downside = np.minimum(daily_rets - rf_daily, 0.0)
+        downside_dev = np.sqrt(np.mean(np.square(downside))) * np.sqrt(252)
+        if downside_dev == 0 or np.isnan(downside_dev):
+            return np.nan
+        return (annual_return - RISK_FREE_RATE) / downside_dev
+
+    def compute_omega_ratio(daily_rets):
+        if daily_rets.empty:
+            return np.nan
+        threshold = daily_risk_free_rate()
+        excess = daily_rets - threshold
+        gains = excess[excess > 0].sum()
+        losses = -excess[excess < 0].sum()
+        if losses == 0 or np.isnan(losses):
+            return np.nan
+        return gains / losses
+
+    def compute_extended_metrics(net_equity_series, gross_equity_series):
+        metrics = compute_metrics(net_equity_series)
+        daily_rets = net_equity_series.pct_change().dropna()
+        gross_total_ret = gross_equity_series.iloc[-1] / gross_equity_series.iloc[0] - 1
+        years = (gross_equity_series.index[-1] - gross_equity_series.index[0]).days / 365.25
+        gross_ann_ret = (1 + gross_total_ret) ** (1 / years) - 1
+        net_total_ret = net_equity_series.iloc[-1] / net_equity_series.iloc[0] - 1
+        metrics.update({
+            "Net Total Return":    net_total_ret,
+            "Gross Total Return":  gross_total_ret,
+            "Gross Annual Return": gross_ann_ret,
+            "Sortino Ratio":       compute_sortino_ratio(daily_rets, metrics["Annual Return"]),
+            "Omega Ratio":         compute_omega_ratio(daily_rets),
+            "Cost Drag":           gross_total_ret - net_total_ret,
+        })
+        return metrics
+
+    def compute_benchmark_metrics(strategy_daily_rets, benchmark_daily_rets):
+        aligned = pd.concat(
+            [strategy_daily_rets.rename("strategy"), benchmark_daily_rets.rename("benchmark")],
+            axis=1,
+            join="inner",
+        ).dropna()
+        if len(aligned) < 2:
+            return {
+                "Alpha": np.nan,
+                "Beta": np.nan,
+                "Information Ratio": np.nan,
+                "Tracking Error": np.nan,
+            }
+
+        strat = aligned["strategy"]
+        bench = aligned["benchmark"]
+        bench_var = bench.var()
+        beta = strat.cov(bench) / bench_var if pd.notna(bench_var) and bench_var != 0 else np.nan
+
+        active = strat - bench
+        active_std = active.std()
+        tracking_error = active_std * np.sqrt(252) if pd.notna(active_std) else np.nan
+        info_ratio = (
+            active.mean() / active_std * np.sqrt(252)
+            if pd.notna(active_std) and active_std != 0 else np.nan
+        )
+
+        rf_daily = daily_risk_free_rate()
+        alpha_daily = (
+            (strat.mean() - rf_daily) - beta * (bench.mean() - rf_daily)
+            if pd.notna(beta) else np.nan
+        )
+        return {
+            "Alpha": alpha_daily * 252 if pd.notna(alpha_daily) else np.nan,
+            "Beta": beta,
+            "Information Ratio": info_ratio,
+            "Tracking Error": tracking_error,
+        }
+
+    def compute_prediction_snapshot_metrics(predicted_series, realized_series):
+        aligned = pd.concat(
+            [predicted_series.rename("predicted"), realized_series.rename("realized")],
+            axis=1,
+            join="inner",
+        ).dropna()
+        if aligned.empty:
+            return None
+
+        pred = aligned["predicted"]
+        real = aligned["realized"]
+        count = len(aligned)
+        return {
+            "universe_size": count,
+            "hit_rate": np.mean(np.sign(pred) == np.sign(real)),
+            "pearson_ic": pred.corr(real, method="pearson") if count >= 2 else np.nan,
+            "spearman_rank_ic": pred.corr(real, method="spearman") if count >= 2 else np.nan,
+            "mae": (pred - real).abs().mean(),
+            "rmse": np.sqrt(((pred - real) ** 2).mean()),
+        }
+
     # ─────────────────────────────────────────────
     # AVAILABLE TICKERS HELPER
     # ─────────────────────────────────────────────
@@ -932,8 +1066,12 @@ def main():
     _prev_S          = None
     _prev_mu         = None
 
-    equity         = pd.DataFrame(100.0, index=returns.index, columns=STRATEGIES)
+    equity            = pd.DataFrame(100.0, index=returns.index, columns=STRATEGIES)
+    gross_equity      = pd.DataFrame(100.0, index=returns.index, columns=STRATEGIES)
     news_log          = []
+    regime_log        = []
+    turnover_log      = {s: [] for s in STRATEGIES}
+    prediction_history = {s: [] for s in STRATEGIES}
     _news_cache       = _load_news_cache()
     _sentiment_cache  = _load_sentiment_cache()
 
@@ -1015,11 +1153,14 @@ def main():
                     # ── Regime switch ──────────────────────────────────────────
                     regime = overall_sentiment_regime(
                         articles, _news_cache, news_start, news_end)
+                    regime_log.append({"date": date, "regime": regime})
+                    prediction_snapshot = {s: {} for s in STRATEGIES}
 
                     # ── MVO ───────────────────────────────────────────────────
                     if ENABLE_STRATEGIES["MVO"]:
                         w["MVO"] = dict(zip(live_tickers,
                                             regime_weights(mu, S, regime)))
+                        prediction_snapshot["MVO"] = mu.reindex(live_tickers).astype(float).to_dict()
 
                     P, Q = build_relative_views(views, live_tickers)
 
@@ -1052,17 +1193,21 @@ def main():
                         print("     No views — falling back to prior directly")
                         return None
 
-                    def _bl_weights(pi_returns, tau):
+                    def _bl_weights(pi_returns, tau, return_signal=False):
                         """Build BL model and optimise using the current sentiment regime.
                         Falls back to regime_weights on pi directly when no views exist."""
+                        pi_signal = as_signal_series(pi_returns, live_tickers)
                         bl_model = _build_bl_model(pi_returns, tau)
                         if bl_model is None:
-                            return regime_weights(pi_returns, S, regime)
-                        ret_bl = bl_model.bl_returns()
+                            weights = regime_weights(pi_signal, S, regime)
+                            return (weights, pi_signal) if return_signal else weights
+                        ret_bl = as_signal_series(bl_model.bl_returns(), live_tickers)
                         if not np.all(np.isfinite(ret_bl)):
                             print("     ⚠ BL returns not finite — falling back to prior")
-                            return regime_weights(pi_returns, S, regime)
-                        return regime_weights(ret_bl, S, regime)
+                            weights = regime_weights(pi_signal, S, regime)
+                            return (weights, pi_signal) if return_signal else weights
+                        weights = regime_weights(ret_bl, S, regime)
+                        return (weights, ret_bl) if return_signal else weights
 
                     # ── Black-Litterman ───────────────────────────────────────
                     if ENABLE_STRATEGIES["Black-Litterman"]:
@@ -1073,8 +1218,13 @@ def main():
                             cov_matrix=S,
                             risk_free_rate=RISK_FREE_RATE,
                         )
-                        raw_w_bl = _bl_weights(pi_mktcap, 1 / len(window))
+                        raw_w_bl, ret_bl_signal = _bl_weights(
+                            pi_mktcap, 1 / len(window), return_signal=True
+                        )
                         w["Black-Litterman"] = dict(zip(live_tickers, raw_w_bl))
+                        prediction_snapshot["Black-Litterman"] = (
+                            as_signal_series(ret_bl_signal, live_tickers).to_dict()
+                        )
 
                     # ── Equal weight ──────────────────────────────────────────
                     if ENABLE_STRATEGIES["Equal_Weight"]:
@@ -1096,6 +1246,9 @@ def main():
                     if ENABLE_STRATEGIES["LSTM_MVO"] and lstm_mu is not None:
                         w["LSTM_MVO"] = dict(zip(live_tickers,
                                                  regime_weights(lstm_mu, S, regime)))
+                        prediction_snapshot["LSTM_MVO"] = (
+                            lstm_mu.reindex(live_tickers).astype(float).to_dict()
+                        )
 
                     # ── LSTM Black-Litterman ───────────────────────────────────
                     # Uses LSTM predictions as the prior (pi) in place of market-cap
@@ -1104,9 +1257,14 @@ def main():
                         try:
                             pi_lstm  = lstm_mu.reindex(live_tickers).fillna(
                                 lstm_mu.mean() if len(lstm_mu) else 0.0)
-                            raw_w_lb = _bl_weights(pi_lstm, 1 / len(window))
+                            raw_w_lb, ret_lstm_bl_signal = _bl_weights(
+                                pi_lstm, 1 / len(window), return_signal=True
+                            )
                             if raw_w_lb is not None:
                                 w["LSTM_BL"] = dict(zip(live_tickers, raw_w_lb))
+                                prediction_snapshot["LSTM_BL"] = (
+                                    as_signal_series(ret_lstm_bl_signal, live_tickers).to_dict()
+                                )
                         except Exception as e:
                             print(f"     ⚠ LSTM_BL failed: {e}")
 
@@ -1115,20 +1273,45 @@ def main():
                     # then subtract turnover costs).
                     for s in STRATEGIES:
                         prev_val = equity.iloc[i - 1][s]
+                        gross_prev_val = gross_equity.iloc[i - 1][s]
+                        prev_weight_arr = np.array(
+                            [prev_weights[s].get(t, 0.0) for t in all_valid_tickers],
+                            dtype=float,
+                        )
+                        new_weight_arr = np.array(
+                            [w[s].get(t, 0.0) for t in all_valid_tickers],
+                            dtype=float,
+                        )
+                        turnover = float(np.abs(new_weight_arr - prev_weight_arr).sum())
+                        transaction_cost_paid = (
+                            turnover * TRANSACTION_COST * prev_val
+                            if ENABLE_TRANSACTION_COSTS else 0.0
+                        )
                         equity.loc[date, s] = apply_transaction_costs(
                             new_weights_dict=w[s],
                             old_weights_dict=prev_weights[s],
                             portfolio_value=prev_val,
                             all_tickers=all_valid_tickers,
                         )
+                        gross_equity.loc[date, s] = gross_prev_val
+                        turnover_log[s].append({
+                            "date": date,
+                            "strategy": s,
+                            "turnover": turnover,
+                            "transaction_cost_paid": transaction_cost_paid,
+                            "portfolio_value_before_cost": prev_val,
+                            "active_positions": int(np.sum(new_weight_arr > 1e-6)),
+                            "weight_change_l2": float(np.linalg.norm(new_weight_arr - prev_weight_arr)),
+                        })
                         prev_weights[s] = w[s].copy()
                         # Update numpy weight array for vectorised P&L
-                        w_arr[s] = np.array([w[s].get(t, 0.0) for t in all_valid_tickers])
+                        w_arr[s] = new_weight_arr
 
                     # ── Record weights (sparse) ────────────────────────────────
                     weight_dates.append(date)
                     for s in STRATEGIES:
                         weight_history[s].append({t: v for t, v in w[s].items() if v > 1e-6})
+                        prediction_history[s].append(prediction_snapshot.get(s, {}))
 
                     # ── Print summary ──────────────────────────────────────────
                     print(f"  ✓  {date.date()}  articles={len(articles)}"
@@ -1156,6 +1339,8 @@ def main():
             pnl  = float(np.dot(w_arr[s], day_returns_valid))
             base = equity.loc[date, s] if date in rebalance_dates else equity.iloc[i - 1][s]
             equity.loc[date, s] = base * (1 + pnl)
+            gross_base = gross_equity.loc[date, s] if date in rebalance_dates else gross_equity.iloc[i - 1][s]
+            gross_equity.loc[date, s] = gross_base * (1 + pnl)
 
     print(f"\nBacktest complete.  Rebalances recorded: {len(weight_dates)}")
 
@@ -1164,6 +1349,11 @@ def main():
     # ─────────────────────────────────────────────
     equity.index  = pd.DatetimeIndex(equity.index).tz_localize(None).normalize()
     equity        = equity.astype(float)
+    gross_equity.index = pd.DatetimeIndex(gross_equity.index).tz_localize(None).normalize()
+    gross_equity = gross_equity.astype(float)
+    regime_df = pd.DataFrame(regime_log)
+    if not regime_df.empty:
+        regime_df["date"] = pd.to_datetime(regime_df["date"]).dt.normalize()
 
     os.makedirs("./metrics", exist_ok=True)
 
@@ -1223,8 +1413,186 @@ def main():
     # SCALAR METRICS
     # ─────────────────────────────────────────────
     metrics_df = pd.DataFrame(
-        {s: compute_metrics(equity[s]) for s in STRATEGIES}
+        {s: compute_extended_metrics(equity[s], gross_equity[s]) for s in STRATEGIES}
     ).T
+
+    turnover_rows = [
+        row
+        for strategy_rows in turnover_log.values()
+        for row in strategy_rows
+    ]
+    turnover_df = pd.DataFrame(turnover_rows)
+    if not turnover_df.empty:
+        turnover_df["date"] = pd.to_datetime(turnover_df["date"]).dt.normalize()
+
+    trading_metrics = pd.DataFrame(index=STRATEGIES)
+    concentration_metrics = pd.DataFrame(index=STRATEGIES)
+    benchmark_metrics = pd.DataFrame(index=STRATEGIES)
+    prediction_metrics = pd.DataFrame(index=STRATEGIES)
+    prediction_rows = []
+    returns_index_positions = {d: idx for idx, d in enumerate(returns.index)}
+
+    for s in STRATEGIES:
+        wdf = build_weight_df(s)
+
+        if not turnover_df.empty:
+            sdf = turnover_df[turnover_df["strategy"].eq(s)].copy()
+        else:
+            sdf = pd.DataFrame()
+
+        if not sdf.empty:
+            trading_metrics.loc[s, "Average Turnover"] = sdf["turnover"].mean()
+            trading_metrics.loc[s, "Total Turnover"] = sdf["turnover"].sum()
+            trading_metrics.loc[s, "Average Transaction Cost Paid"] = sdf["transaction_cost_paid"].mean()
+            trading_metrics.loc[s, "Total Transaction Cost Paid"] = sdf["transaction_cost_paid"].sum()
+            trading_metrics.loc[s, "Number of Rebalances"] = len(sdf)
+            trading_metrics.loc[s, "Average Active Positions"] = sdf["active_positions"].mean()
+            trading_metrics.loc[s, "Average Weight Change L2"] = sdf["weight_change_l2"].mean()
+        else:
+            trading_metrics.loc[s, [
+                "Average Turnover",
+                "Total Turnover",
+                "Average Transaction Cost Paid",
+                "Total Transaction Cost Paid",
+                "Number of Rebalances",
+                "Average Active Positions",
+                "Average Weight Change L2",
+            ]] = np.nan
+
+        if not wdf.empty:
+            max_weight_series = wdf.max(axis=1)
+            sorted_weights = np.sort(wdf.values, axis=1)[:, ::-1]
+            top5_share = sorted_weights[:, :min(5, sorted_weights.shape[1])].sum(axis=1)
+            hhi = np.square(wdf).sum(axis=1)
+            effective_bets = np.where(hhi > 0, 1 / hhi, np.nan)
+            concentration_metrics.loc[s, "Peak Max Weight"] = max_weight_series.max()
+            concentration_metrics.loc[s, "Average Max Weight"] = max_weight_series.mean()
+            concentration_metrics.loc[s, "Average Top-5 Weight Share"] = np.mean(top5_share)
+            concentration_metrics.loc[s, "Average HHI"] = hhi.mean()
+            concentration_metrics.loc[s, "Average Effective Bets"] = np.nanmean(effective_bets)
+        else:
+            concentration_metrics.loc[s, [
+                "Peak Max Weight",
+                "Average Max Weight",
+                "Average Top-5 Weight Share",
+                "Average HHI",
+                "Average Effective Bets",
+            ]] = np.nan
+
+        benchmark_stats = compute_benchmark_metrics(
+            equity[s].pct_change().dropna(),
+            benchmark_returns,
+        )
+        for key, value in benchmark_stats.items():
+            benchmark_metrics.loc[s, key] = value
+
+        strategy_prediction_rows = []
+        for k in range(len(weight_dates) - 1):
+            signal_dict = prediction_history[s][k] if k < len(prediction_history[s]) else {}
+            if not signal_dict:
+                continue
+
+            start_date = pd.Timestamp(weight_dates[k]).normalize()
+            next_date = pd.Timestamp(weight_dates[k + 1]).normalize()
+            if start_date not in returns_index_positions or next_date not in returns_index_positions:
+                continue
+
+            start_loc = returns_index_positions[start_date]
+            end_loc = returns_index_positions[next_date] - 1
+            if end_loc < start_loc:
+                continue
+
+            predicted_series = pd.Series(signal_dict, dtype=float)
+            realized_slice = returns.iloc[start_loc:end_loc + 1].reindex(columns=predicted_series.index)
+            realized_forward = (1 + realized_slice.fillna(0.0)).prod() - 1
+            snapshot_metrics = compute_prediction_snapshot_metrics(predicted_series, realized_forward)
+            if snapshot_metrics is None:
+                continue
+
+            snapshot_metrics.update({
+                "date": start_date,
+                "strategy": s,
+            })
+            prediction_rows.append(snapshot_metrics)
+            strategy_prediction_rows.append(snapshot_metrics)
+
+        if strategy_prediction_rows:
+            pdf = pd.DataFrame(strategy_prediction_rows)
+            ic_mean = pdf["pearson_ic"].mean()
+            ic_std = pdf["pearson_ic"].std()
+            ic_count = pdf["pearson_ic"].dropna().shape[0]
+            ic_t_stat = (
+                ic_mean / (ic_std / np.sqrt(ic_count))
+                if ic_count >= 2 and pd.notna(ic_std) and ic_std != 0 else np.nan
+            )
+            prediction_metrics.loc[s, "Hit Rate"] = pdf["hit_rate"].mean()
+            prediction_metrics.loc[s, "Pearson IC"] = ic_mean
+            prediction_metrics.loc[s, "Spearman Rank IC"] = pdf["spearman_rank_ic"].mean()
+            prediction_metrics.loc[s, "IC Std"] = ic_std
+            prediction_metrics.loc[s, "IC t-Stat"] = ic_t_stat
+            prediction_metrics.loc[s, "MAE"] = pdf["mae"].mean()
+            prediction_metrics.loc[s, "RMSE"] = pdf["rmse"].mean()
+        else:
+            prediction_metrics.loc[s, [
+                "Hit Rate",
+                "Pearson IC",
+                "Spearman Rank IC",
+                "IC Std",
+                "IC t-Stat",
+                "MAE",
+                "RMSE",
+            ]] = np.nan
+
+    metrics_df = (
+        metrics_df
+        .join(trading_metrics, how="left")
+        .join(concentration_metrics, how="left")
+        .join(benchmark_metrics, how="left")
+        .join(prediction_metrics, how="left")
+    )
+
+    ordered_cols = [
+        "Net Total Return",
+        "Gross Total Return",
+        "Annual Return",
+        "Gross Annual Return",
+        "Annual Volatility",
+        "Sharpe Ratio",
+        "Sortino Ratio",
+        "Omega Ratio",
+        "Max Drawdown",
+        "Calmar Ratio",
+        "CVaR (95%)",
+        "Cost Drag",
+        "Average Turnover",
+        "Total Turnover",
+        "Average Transaction Cost Paid",
+        "Total Transaction Cost Paid",
+        "Number of Rebalances",
+        "Average Active Positions",
+        "Average Weight Change L2",
+        "Peak Max Weight",
+        "Average Max Weight",
+        "Average Top-5 Weight Share",
+        "Average HHI",
+        "Average Effective Bets",
+        "Alpha",
+        "Beta",
+        "Information Ratio",
+        "Tracking Error",
+        "Hit Rate",
+        "Pearson IC",
+        "Spearman Rank IC",
+        "IC Std",
+        "IC t-Stat",
+        "MAE",
+        "RMSE",
+    ]
+    metrics_df = metrics_df.reindex(columns=ordered_cols)
+
+    prediction_diag_df = pd.DataFrame(prediction_rows)
+    if not prediction_diag_df.empty:
+        prediction_diag_df["date"] = pd.to_datetime(prediction_diag_df["date"]).dt.normalize()
 
     print("\n── Performance Summary ────────────────────────────────────────")
     print(f"  Transaction costs : "
@@ -1243,6 +1611,45 @@ def main():
     def safe_plot(ax, series, **kwargs):
         ax.plot(series.index.to_numpy(), series.to_numpy(), **kwargs)
 
+    def plot_summary_grid(frame, metric_cols, title, out_path, nrows, ncols):
+        fig, axes = plt.subplots(nrows, ncols, figsize=FIG_SQUARE)
+        axes = np.atleast_1d(axes).flatten()
+
+        for idx, col in enumerate(metric_cols):
+            ax = axes[idx]
+            if col not in frame.columns:
+                ax.axis("off")
+                continue
+            values = frame[col].astype(float)
+            bars = ax.bar(
+                STRATEGIES, values,
+                color=[STRAT_COLORS[s] for s in STRATEGIES],
+                edgecolor="white", linewidth=0.6,
+            )
+            ax.set_title(col, fontsize=11, fontweight="bold")
+            ax.set_xticks(range(len(STRATEGIES)))
+            ax.set_xticklabels(STRATEGIES, rotation=25, ha="right", fontsize=9)
+            ax.axhline(0, color="black", linewidth=0.8)
+            ax.grid(axis="y", alpha=0.3)
+            for bar, val in zip(bars, values):
+                if pd.isna(val):
+                    continue
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + (0.001 if val >= 0 else -0.005),
+                    f"{val:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+        for ax in axes[len(metric_cols):]:
+            ax.axis("off")
+
+        fig.suptitle(title, fontsize=13, fontweight="bold")
+        fig.tight_layout(pad=2.5)
+        plt.savefig(out_path)
+
     # ─────────────────────────────────────────────
     # FIG 1 – Equity Curves
     # ─────────────────────────────────────────────
@@ -1259,6 +1666,46 @@ def main():
     ax.legend()
     apply_layout(fig)
     plt.savefig("./metrics/fig1_equity_curves.png")
+
+    if not regime_df.empty:
+        fig, ax = plt.subplots(figsize=FIG_WIDE)
+        regime_colors = {
+            "bad": "#ef9a9a",
+            "neutral": "#ffe082",
+            "good": "#a5d6a7",
+        }
+
+        regime_dates = regime_df["date"].tolist()
+        regime_labels = regime_df["regime"].tolist()
+        for idx, (start, regime_name) in enumerate(zip(regime_dates, regime_labels)):
+            end = regime_dates[idx + 1] if idx + 1 < len(regime_dates) else equity.index[-1]
+            ax.axvspan(
+                start,
+                end,
+                color=regime_colors.get(regime_name, "#cfd8dc"),
+                alpha=0.30,
+                linewidth=0,
+            )
+
+        for s in STRATEGIES:
+            safe_plot(ax, equity[s], label=s, color=STRAT_COLORS[s], linewidth=2.0)
+
+        ax.set_title("Portfolio Equity Curves with Regime Overlay", fontsize=13, fontweight="bold")
+        ax.set_ylabel("Portfolio Value (base 100)")
+        yearly_xaxis(ax)
+        expand_xlim(ax)
+
+        strategy_legend = ax.legend(loc="upper left")
+        regime_handles = [
+            Patch(facecolor=regime_colors["bad"], edgecolor="none", alpha=0.30, label="Bad"),
+            Patch(facecolor=regime_colors["neutral"], edgecolor="none", alpha=0.30, label="Neutral"),
+            Patch(facecolor=regime_colors["good"], edgecolor="none", alpha=0.30, label="Good"),
+        ]
+        regime_legend = ax.legend(handles=regime_handles, loc="upper right", title="Regime")
+        ax.add_artist(strategy_legend)
+        ax.add_artist(regime_legend)
+        apply_layout(fig, extra_bottom=0.10)
+        plt.savefig("./metrics/fig15_equity_curves_by_regime.png")
 
     # ─────────────────────────────────────────────
     # FIG 2 – Rolling Drawdown
@@ -1422,12 +1869,143 @@ def main():
     fig.tight_layout(pad=2.5)
     plt.savefig("./metrics/fig7_summary_metrics.png")
 
+    if not turnover_df.empty:
+        fig, axes = plt.subplots(3, 1, figsize=(FIG_WIDE[0], 12), sharex=True)
+        turnover_pivot = turnover_df.pivot(index="date", columns="strategy", values="turnover")
+        cost_pivot = turnover_df.pivot(index="date", columns="strategy", values="transaction_cost_paid")
+        active_pivot = turnover_df.pivot(index="date", columns="strategy", values="active_positions")
+
+        for s in STRATEGIES:
+            if s in turnover_pivot:
+                safe_plot(axes[0], turnover_pivot[s], label=s, color=STRAT_COLORS[s], linewidth=1.8)
+            if s in cost_pivot:
+                safe_plot(axes[1], cost_pivot[s], label=s, color=STRAT_COLORS[s], linewidth=1.8)
+            if s in active_pivot:
+                safe_plot(axes[2], active_pivot[s], label=s, color=STRAT_COLORS[s], linewidth=1.8)
+
+        axes[0].set_title("Rebalance Turnover", fontsize=13, fontweight="bold")
+        axes[0].set_ylabel("Turnover")
+        axes[1].set_title("Transaction Cost Paid per Rebalance", fontsize=13, fontweight="bold")
+        axes[1].set_ylabel("Cost")
+        axes[2].set_title("Active Positions per Rebalance", fontsize=13, fontweight="bold")
+        axes[2].set_ylabel("# Positions")
+        monthly_xaxis(axes[2])
+        expand_xlim(axes[2])
+        for ax in axes:
+            ax.legend()
+        apply_layout(fig, extra_bottom=0.12)
+        plt.savefig("./metrics/fig8_turnover_costs.png")
+
+    plot_summary_grid(
+        trading_metrics,
+        [
+            "Average Turnover",
+            "Total Turnover",
+            "Average Transaction Cost Paid",
+            "Total Transaction Cost Paid",
+            "Number of Rebalances",
+            "Average Active Positions",
+        ],
+        "Trading Diagnostics Summary",
+        "./metrics/fig9_trading_diagnostics.png",
+        2, 3,
+    )
+
+    if not prediction_diag_df.empty:
+        fig, axes = plt.subplots(2, 2, figsize=FIG_SQUARE, sharex=True)
+        rebalance_metric_specs = [
+            ("hit_rate", "Hit Rate"),
+            ("pearson_ic", "Pearson IC"),
+            ("spearman_rank_ic", "Spearman Rank IC"),
+            ("rmse", "RMSE"),
+        ]
+        for ax, (col, title) in zip(axes.flatten(), rebalance_metric_specs):
+            pivot = prediction_diag_df.pivot(index="date", columns="strategy", values=col)
+            for s in STRATEGIES:
+                if s in pivot:
+                    safe_plot(ax, pivot[s], label=s, color=STRAT_COLORS[s], linewidth=1.8)
+            ax.set_title(title, fontsize=11, fontweight="bold")
+            ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+            yearly_xaxis(ax)
+            expand_xlim(ax)
+            ax.legend()
+        fig.suptitle("Prediction Diagnostics by Rebalance", fontsize=13, fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.savefig("./metrics/fig10_prediction_by_rebalance.png")
+
+    plot_summary_grid(
+        prediction_metrics,
+        [
+            "Hit Rate",
+            "Pearson IC",
+            "Spearman Rank IC",
+            "IC t-Stat",
+            "MAE",
+            "RMSE",
+        ],
+        "Prediction Diagnostics Summary",
+        "./metrics/fig11_prediction_summary.png",
+        2, 3,
+    )
+
+    plot_summary_grid(
+        metrics_df,
+        [
+            "Net Total Return",
+            "Gross Total Return",
+            "Gross Annual Return",
+            "Sortino Ratio",
+            "Omega Ratio",
+            "Cost Drag",
+        ],
+        "Extended Performance Metrics",
+        "./metrics/fig12_extended_performance.png",
+        2, 3,
+    )
+
+    plot_summary_grid(
+        benchmark_metrics,
+        [
+            "Alpha",
+            "Beta",
+            "Information Ratio",
+            "Tracking Error",
+        ],
+        "Benchmark Diagnostics Summary",
+        "./metrics/fig13_benchmark_diagnostics.png",
+        2, 2,
+    )
+
+    plot_summary_grid(
+        concentration_metrics,
+        [
+            "Peak Max Weight",
+            "Average Max Weight",
+            "Average Top-5 Weight Share",
+            "Average HHI",
+            "Average Effective Bets",
+        ],
+        "Concentration Diagnostics Summary",
+        "./metrics/fig14_concentration_diagnostics.png",
+        2, 3,
+    )
+
     # ─────────────────────────────────────────────
     # EXPORT
     # ─────────────────────────────────────────────
     equity.to_csv("./metrics/equity_curves.csv")
+    gross_equity.to_csv("./metrics/equity_curves_gross.csv")
     metrics_df.to_csv("./metrics/performance_metrics.csv")
     pd.DataFrame(news_log).to_csv("./metrics/news_log.csv", index=False)
+    trading_metrics.to_csv("./metrics/trading_diagnostics.csv")
+    concentration_metrics.to_csv("./metrics/concentration_diagnostics.csv")
+    benchmark_metrics.to_csv("./metrics/benchmark_diagnostics.csv")
+    prediction_metrics.to_csv("./metrics/prediction_diagnostics.csv")
+    turnover_df.to_csv("./metrics/turnover_costs_by_rebalance.csv", index=False)
+    prediction_diag_df.to_csv("./metrics/prediction_diagnostics_by_rebalance.csv", index=False)
+    regime_df.to_csv("./metrics/regime_by_rebalance.csv", index=False)
+    if not benchmark_equity.empty:
+        benchmark_equity.to_frame("benchmark_equity").to_csv("./metrics/benchmark_equity_curve.csv")
 
     # ── Rebalance weights log ──────────────────────────────────────────────────
     rebalance_rows = []
@@ -1442,9 +2020,18 @@ def main():
                 })
     pd.DataFrame(rebalance_rows).to_csv("./metrics/rebalance_weights.csv", index=False)
 
+    print("\nâœ“ CSVs: ./metrics/equity_curves_gross.csv | ./metrics/trading_diagnostics.csv | ./metrics/concentration_diagnostics.csv")
+    print("âœ“ CSVs: ./metrics/benchmark_diagnostics.csv | ./metrics/prediction_diagnostics.csv | ./metrics/turnover_costs_by_rebalance.csv")
+    print("âœ“ CSVs: ./metrics/prediction_diagnostics_by_rebalance.csv")
+
     print("\n✓ CSVs: ./metrics/equity_curves.csv | ./metrics/performance_metrics.csv | ./metrics/news_log.csv | ./metrics/rebalance_weights.csv")
     print("✓ Figs: fig1–fig7")
 
+    print("CSVs: ./metrics/equity_curves.csv | ./metrics/equity_curves_gross.csv | ./metrics/performance_metrics.csv")
+    print("CSVs: ./metrics/trading_diagnostics.csv | ./metrics/concentration_diagnostics.csv | ./metrics/benchmark_diagnostics.csv")
+    print("CSVs: ./metrics/prediction_diagnostics.csv | ./metrics/turnover_costs_by_rebalance.csv | ./metrics/prediction_diagnostics_by_rebalance.csv")
+    print("CSVs: ./metrics/news_log.csv | ./metrics/rebalance_weights.csv")
+    print("Figs: fig8-fig14")
 
 if __name__ == "__main__":
     main()
