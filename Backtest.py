@@ -62,8 +62,8 @@ MIN_HISTORY_DAYS   = 1
 ENABLE_MVO              = True
 ENABLE_BLACK_LITTERMAN  = True
 ENABLE_EQUAL_WEIGHT     = True
-ENABLE_LSTM_MVO         = False #True
-ENABLE_LSTM_BL          = False #True
+ENABLE_LSTM_MVO         = True #True
+ENABLE_LSTM_BL          = True #True
 
 # ── TRANSACTION COSTS ─────────────────────────
 ENABLE_TRANSACTION_COSTS = True
@@ -184,6 +184,8 @@ def main():
                         help=f"Backtest start date (default: {START_DATE})")
     parser.add_argument("--end",   default=END_DATE,   metavar="YYYY-MM-DD",
                         help=f"Backtest end date   (default: {END_DATE})")
+    parser.add_argument("--sector",   default=SP500_GICS_FILTER,   metavar="SECTOR",
+                        help=f"S&P 500 sector to backtest (default: {SP500_GICS_FILTER})")
     parser.add_argument(
         "--enable-strategies", nargs="+",
         metavar="STRATEGY",
