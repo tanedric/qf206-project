@@ -155,20 +155,55 @@ def silent_download(tickers, start, end):
 # ─────────────────────────────────────────────
 # TICKER CLASSIFICATION
 # ─────────────────────────────────────────────
-def classify_tickers(tickers, start_date, end_date):
+def extract_price_frame(raw, tickers):
+    """Normalize a yfinance download payload into a price matrix.
+
+    CHANGED: this lets one bulk download power both ticker classification and
+    the later backtest, removing duplicate network calls without changing the
+    intended portfolio logic.
+    """
+    if raw.empty:
+        return pd.DataFrame(columns=tickers)
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = raw.columns.get_level_values(0)
+        field = "Adj Close" if "Adj Close" in lvl0 else "Close"
+        prices = raw.xs(field, axis=1, level=0)
+    else:
+        field = "Adj Close" if "Adj Close" in raw.columns else "Close"
+        if field in raw.columns:
+            col_name = tickers[0] if len(tickers) == 1 else field
+            prices = raw[field].to_frame(name=col_name)
+        else:
+            prices = raw.copy()
+
+    if isinstance(prices, pd.Series):
+        col_name = tickers[0] if len(tickers) == 1 else prices.name or "price"
+        prices = prices.to_frame(name=col_name)
+
+    prices.index = pd.DatetimeIndex(prices.index).tz_localize(None).normalize()
+    return prices
+
+
+def classify_tickers(tickers, start_date, prices):
     active, delisted, ipo_map = [], [], {}
     start_dt = pd.Timestamp(start_date).tz_localize(None)
     for t in tickers:
         try:
-            df = silent_download(t, start_date, end_date)
-            if df.empty or len(df) < 5:
+            if t not in prices.columns:
                 print(f"  ✗  {t}: no data → delisted")
                 delisted.append(t)
-            elif df.index[0].tz_localize(None) <= start_dt + pd.Timedelta(days=5):
-                print(f"  ✓  {t}: full history from {df.index[0].date()}")
+                continue
+
+            series = prices[t].dropna()
+            if series.empty or len(series) < 5:
+                print(f"  ✗  {t}: no data → delisted")
+                delisted.append(t)
+            elif series.index[0] <= start_dt + pd.Timedelta(days=5):
+                print(f"  ✓  {t}: full history from {series.index[0].date()}")
                 active.append(t)
             else:
-                first = df.index[0].tz_localize(None)
+                first = series.index[0]
                 print(f"  ◑  {t}: IPO/data starts {first.date()}")
                 ipo_map[t] = first
         except Exception as e:
@@ -363,9 +398,14 @@ def main():
     filter_label = f"  (filter: '{SP500_GICS_FILTER}')" if SP500_GICS_FILTER else ""
     print(f"✓ S&P 500 ever-members {START_DATE}→{END_DATE}: {len(sp500_initial)} tickers{filter_label}\n")
 
+    # CHANGED: one bulk universe download is now reused for both classification
+    # and the later backtest price matrix.
+    raw_initial = silent_download(sp500_initial, START_DATE, END_DATE)
+    initial_prices = extract_price_frame(raw_initial, sp500_initial)
+
     print("── Ticker Classification ───────────────────────────────────────")
     active_tickers, ipo_map, delisted_tickers = classify_tickers(
-        sp500_initial, START_DATE, END_DATE)
+        sp500_initial, START_DATE, initial_prices)
     all_valid_tickers = active_tickers + list(ipo_map.keys())
     print(f"\n  Active   : {active_tickers}")
     print(f"  IPO      : { {k: v.date() for k, v in ipo_map.items()} }")
@@ -374,9 +414,8 @@ def main():
     # ─────────────────────────────────────────────
     # DATA DOWNLOAD
     # ─────────────────────────────────────────────
-    raw    = silent_download(all_valid_tickers, START_DATE, END_DATE)
-    prices = (raw["Adj Close"] if "Adj Close" in raw.columns else raw["Close"])
-    prices.index = pd.DatetimeIndex(prices.index).tz_localize(None).normalize()
+    raw    = raw_initial
+    prices = initial_prices.reindex(columns=all_valid_tickers)
     prices = prices.ffill()
 
     for ticker, ipo_date in ipo_map.items():

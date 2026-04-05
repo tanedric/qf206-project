@@ -442,14 +442,23 @@ function setTabsVisibility(show) {
 function renderKpis() {
   const selected = getStrategiesInView();
   const metrics = getPerformanceMap();
+  const comparisonMode = document.getElementById("comparison-mode").value;
   const focus = document.getElementById("focus-strategy").value;
   const baseline = document.getElementById("baseline-strategy").value;
   const summaryRows = state.results.summaryRanking.filter((row) => selected.includes(row.strategy));
   const best = summaryRows[0];
-  const focusMetrics = metrics.get(focus) || {};
+  const metricStrategy = comparisonMode === "all"
+    ? (best ? best.strategy : focus)
+    : focus;
+  const focusMetrics = metrics.get(metricStrategy) || {};
   const baselineMetrics = metrics.get(baseline) || {};
-  const terminalValue = getLatestEquityValue(focus);
+  const terminalValue = getLatestEquityValue(metricStrategy);
   const returnDelta = toNumber(focusMetrics["Annual Return"]) - toNumber(baselineMetrics["Annual Return"]);
+  const annualLabel = document.getElementById("kpi-annual-label");
+  const focusName = document.getElementById("kpi-focus-name");
+  const sharpeSub = document.getElementById("kpi-sharpe-sub");
+  const drawdownSub = document.getElementById("kpi-drawdown-sub");
+  const terminalSub = document.getElementById("kpi-terminal-sub");
 
   document.getElementById("kpi-best-strategy").textContent = best ? best.strategy : "-";
   document.getElementById("kpi-annual-return").textContent = formatPercent(focusMetrics["Annual Return"]);
@@ -457,7 +466,13 @@ function renderKpis() {
   document.getElementById("kpi-drawdown").textContent = formatPercent(focusMetrics["Max Drawdown"]);
   document.getElementById("kpi-terminal").textContent = formatCurrency(terminalValue);
   document.getElementById("kpi-delta").textContent = `${returnDelta >= 0 ? "+" : ""}${formatPercent(returnDelta)}`;
-  document.getElementById("kpi-focus-name").textContent = focus;
+  annualLabel.textContent = comparisonMode === "all"
+    ? "Best Strategy Annual Return"
+    : "Focus Strategy Annual Return";
+  focusName.textContent = metricStrategy;
+  sharpeSub.textContent = `Risk-adjusted return for ${metricStrategy}`;
+  drawdownSub.textContent = `Worst peak-to-trough loss for ${metricStrategy}`;
+  terminalSub.textContent = `${metricStrategy} scaled by selected initial capital`;
   document.getElementById("kpi-baseline-name").textContent = `Annual return vs ${baseline}`;
 }
 
