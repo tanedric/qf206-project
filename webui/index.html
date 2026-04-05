@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quant Backtest Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-header-copy">
+              <h2>Controls</h2>
+              <p>Minimal backend changes, same core backtest logic.</p>
+            </div>
+            <div class="static-settings compact-settings compact-settings-inline">
+              <div>
+                <span class="meta-label">Benchmark</span>
+                <span id="meta-benchmark" class="meta-value"></span>
+              </div>
+              <div>
+                <span class="meta-label">Rebalance</span>
+                <span id="meta-rebalance" class="meta-value"></span>
+              </div>
+              <div>
+                <span class="meta-label">Membership</span>
+                <span id="meta-membership" class="meta-value"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-grid compact-grid">
+            <label class="field">
+              <span class="label-row">
+                <span>Strategies</span>
+                <span class="info-icon" data-tip="Choose one or more strategies to run in the backtest.">i</span>
+              </span>
+              <div id="strategy-selector" class="chip-grid"></div>
+            </label>
+
+            <div class="field-row two-cols compact-block">
+              <label class="field">
+                <span class="label-row">
+                  <span>Start Date</span>
+                  <span class="info-icon" data-tip="First date included in the backtest window.">i</span>
+                </span>
+                <input id="start-date" type="date" />
+              </label>
+              <label class="field">
+                <span class="label-row">
+                  <span>End Date</span>
+                  <span class="info-icon" data-tip="Last date included in the backtest window.">i</span>
+                </span>
+                <input id="end-date" type="date" />
+              </label>
+            </div>
+
+            <label class="field compact-block">
+              <span class="label-row">
+                <span>Universe Filter</span>
+                <span class="info-icon" data-tip="Filter the S&amp;P 500 universe by GICS sector or sub-industry. Choose All S&amp;P 500 to remove the filter.">i</span>
+              </span>
+              <div class="combo" id="sector-combo">
+                <input id="sector-search" type="text" autocomplete="off" placeholder="Search sector or sub-industry" />
+                <button id="sector-toggle" type="button" class="combo-toggle" aria-label="Toggle sector list">&#9662;</button>
+                <div id="sector-menu" class="combo-menu hidden"></div>
+                <input id="sector-value" type="hidden" />
+              </div>
+            </label>
+
+            <div class="field-row two-cols compact-block">
+              <label class="field">
+                <span class="label-row">
+                  <span>Sentiment Window</span>
+                  <span class="info-icon" data-tip="Rolling number of days of recent news used to build sentiment views. Default is 15 days.">i</span>
+                </span>
+                <input id="sentiment-window" type="number" min="1" step="1" />
+              </label>
+              <label class="field">
+                <span class="label-row">
+                  <span>Transaction Cost (bps)</span>
+                  <span class="info-icon" data-tip="Trading cost per rebalance. 10 bps means you lose 0.10% of the traded amount each time you trade.">i</span>
+                </span>
+                <input id="transaction-cost" type="number" min="0" step="1" />
+              </label>
+            </div>
+
+            <div class="field-row two-cols compact-block">
+              <label class="field">
+                <span class="label-row">
+                  <span>Initial Capital</span>
+                  <span class="info-icon" data-tip="Used to scale the equity curve display and terminal value cards.">i</span>
+                </span>
+                <input id="initial-capital" type="number" min="100" step="100" />
+              </label>
+              <label class="field">
+                <span class="label-row">
+                  <span>Comparison Mode</span>
+                  <span class="info-icon" data-tip="All Selected shows all chosen strategies. Focus vs Baseline shows only the highlighted strategy against the baseline.">i</span>
+                </span>
+                <select id="comparison-mode">
+                  <option value="all">All Selected</option>
+                  <option value="focus-baseline">Focus vs Baseline</option>
+                </select>
+              </label>
+            </div>
+
+            <div id="focus-baseline-fields" class="field-row two-cols compact-block">
+              <label class="field">
+                <span class="label-row">
+                  <span>Focus Strategy</span>
+                  <span class="info-icon" data-tip="The highlighted strategy used in KPI cards and detail views.">i</span>
+                </span>
+                <select id="focus-strategy"></select>
+              </label>
+              <label class="field">
+                <span class="label-row">
+                  <span>Baseline Strategy</span>
+                  <span class="info-icon" data-tip="Reference strategy used for comparison deltas. Default is MVO.">i</span>
+                </span>
+                <select id="baseline-strategy"></select>
+              </label>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button id="run-backtest" class="primary-btn" type="button">Run Backtest</button>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main-content">
+        <header class="top-bar">
+          <div>
+            <p class="eyebrow">Interactive Results</p>
+            <h2>Backtest Dashboard</h2>
+          </div>
+          <div class="export-actions">
+            <a id="download-csv" class="ghost-btn disabled" href="#" download>Download CSV</a>
+            <a id="download-png" class="ghost-btn disabled" href="#" download>Download PNG</a>
+            <a id="download-report" class="ghost-btn disabled" href="#" download>Download Report</a>
+          </div>
+        </header>
+
+        <section class="kpi-grid">
+          <article class="kpi-card">
+            <span class="kpi-label">Best Strategy</span>
+            <strong id="kpi-best-strategy">-</strong>
+            <span class="kpi-sub">Highest Sharpe ratio among selected strategies</span>
+          </article>
+          <article class="kpi-card">
+            <span class="kpi-label">Focus Strategy Annual Return</span>
+            <strong id="kpi-annual-return">-</strong>
+            <span class="kpi-sub" id="kpi-focus-name">-</span>
+          </article>
+          <article class="kpi-card">
+            <span class="kpi-label">Sharpe Ratio</span>
+            <strong id="kpi-sharpe">-</strong>
+            <span class="kpi-sub">Risk-adjusted return</span>
+          </article>
+          <article class="kpi-card">
+            <span class="kpi-label">Max Drawdown</span>
+            <strong id="kpi-drawdown">-</strong>
+            <span class="kpi-sub">Worst peak-to-trough loss</span>
+          </article>
+          <article class="kpi-card">
+            <span class="kpi-label">Terminal Value</span>
+            <strong id="kpi-terminal">-</strong>
+            <span class="kpi-sub">Scaled by selected initial capital</span>
+          </article>
+          <article id="kpi-delta-card" class="kpi-card">
+            <span class="kpi-label">Delta vs Baseline</span>
+            <strong id="kpi-delta">-</strong>
+            <span class="kpi-sub" id="kpi-baseline-name">-</span>
+          </article>
+        </section>
+
+        <section id="tabs-shell" class="tabs-shell hidden-tabs">
+          <div class="tab-buttons">
+            <button type="button" class="tab-btn active" data-tab="overview">Overview</button>
+            <button type="button" class="tab-btn" data-tab="risk">Risk</button>
+            <button type="button" class="tab-btn" data-tab="allocation">Allocation</button>
+            <button type="button" class="tab-btn" data-tab="diagnostics">Diagnostics</button>
+            <button type="button" class="tab-btn" data-tab="regime">Regime</button>
+            <button type="button" class="tab-btn" data-tab="methodology">Methodology</button>
+          </div>
+
+          <div id="tab-overview" class="tab-panel active">
+            <section class="hero-card">
+              <div class="section-heading">
+                <div>
+                  <h3>Portfolio Equity Curve</h3>
+                  <p>Primary view of how the selected strategies compounded over the backtest window.</p>
+                </div>
+              </div>
+              <div id="hero-empty-state" class="empty-plot-state">
+                <strong>Ready when you are.</strong>
+                <p>Pick your inputs above and click <code>Run Backtest</code> to generate the portfolio equity curve, KPI cards, and drill-down charts.</p>
+              </div>
+              <div id="hero-chart" class="plot plot-hero hidden-plot"></div>
+            </section>
+            <div class="card-grid two-up">
+              <section class="card">
+                <div class="section-heading compact">
+                  <div>
+                    <h3>Summary Metrics</h3>
+                    <p>Core comparison across selected strategies.</p>
+                  </div>
+                </div>
+                <div id="overview-summary-chart" class="plot plot-medium"></div>
+              </section>
+              <section class="card">
+                <div class="section-heading compact">
+                  <div>
+                    <h3>Strategy Ranking</h3>
+                    <p>Click any column header to sort the selected strategies.</p>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table id="ranking-table" class="data-table"></table>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <div id="tab-risk" class="tab-panel">
+            <div class="card-grid two-up">
+              <section class="card">
+                <h3>Drawdown</h3>
+                <p>Current loss relative to prior peak.</p>
+                <div id="risk-drawdown-chart" class="plot plot-medium"></div>
+              </section>
+              <section class="card">
+                <h3>Rolling Volatility</h3>
+                <p>21-day annualised realised volatility.</p>
+                <div id="risk-vol-chart" class="plot plot-medium"></div>
+              </section>
+              <section class="card">
+                <h3>Rolling Sharpe</h3>
+                <p>Short-horizon risk-adjusted performance.</p>
+                <div id="risk-sharpe-chart" class="plot plot-medium"></div>
+              </section>
+              <section class="card">
+                <h3>Rolling CVaR</h3>
+                <p>Average loss in the worst 5% of recent returns.</p>
+                <div id="risk-cvar-chart" class="plot plot-medium"></div>
+              </section>
+            </div>
+          </div>
+
+          <div id="tab-allocation" class="tab-panel">
+            <div class="card-grid">
+              <section class="card">
+                <div class="section-heading compact">
+                  <div>
+                    <h3>All-Strategy Allocation Snapshot</h3>
+                    <p>Cross-strategy comparison from the generated weight figure for this run.</p>
+                  </div>
+                </div>
+                <div class="allocation-explainer">
+                  <p>Use this view like <code>fig6</code>: each stacked bar shows how weights are spread across holdings at each rebalance date, so you can compare diversification and stability across all selected strategies at once.</p>
+                </div>
+                <img id="allocation-compare-image" class="metric-image" alt="Allocation comparison across selected strategies" />
+              </section>
+              <section class="card">
+                <div class="section-heading compact">
+                  <div>
+                    <h3>Allocation Strategy</h3>
+                    <p>Inspect one selected strategy in more detail.</p>
+                  </div>
+                  <select id="allocation-strategy"></select>
+                </div>
+                <div class="allocation-explainer">
+                  <p>The stacked area chart shows how the top holdings and the residual <code>Other</code> bucket evolve through time. The heatmap highlights which names consistently dominated the portfolio and when weights spiked or rotated.</p>
+                </div>
+                <div class="card-grid two-up">
+                  <div id="allocation-top5-chart" class="plot plot-medium"></div>
+                  <div id="allocation-heatmap-chart" class="plot plot-medium"></div>
+                </div>
+              </section>
+              <section class="card">
+                <div class="section-heading compact">
+                  <div>
+                    <h3>Allocation Diagnostics</h3>
+                    <p>Turnover, active positions, and concentration.</p>
+                  </div>
+                </div>
+                <div class="allocation-explainer">
+                  <p>Turnover measures how much the portfolio changes at each rebalance. Active positions shows how many holdings carry meaningful weight. The concentration bars summarize how top-heavy the strategy is overall.</p>
+                </div>
+                <div class="card-grid two-up">
+                  <div id="allocation-turnover-chart" class="plot plot-medium"></div>
+                  <div id="allocation-concentration-chart" class="plot plot-medium"></div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <div id="tab-diagnostics" class="tab-panel">
+            <div class="card-grid two-up">
+              <section class="card">
+                <h3>Prediction Diagnostics</h3>
+                <p>Signal quality across forecast-driven strategies.</p>
+                <div id="diag-prediction-chart" class="plot plot-medium"></div>
+              </section>
+              <section class="card">
+                <h3>Benchmark Diagnostics</h3>
+                <p>Alpha, beta, information ratio, and tracking error vs benchmark.</p>
+                <div id="diag-benchmark-chart" class="plot plot-medium"></div>
+              </section>
+            </div>
+          </div>
+
+          <div id="tab-regime" class="tab-panel">
+            <div class="card-grid two-up">
+              <section class="card">
+                <h3>Equity Curve with Regime Overlay</h3>
+                <p>Performance path shaded by the current sentiment regime classification.</p>
+                <div id="regime-overlay-chart" class="plot plot-large"></div>
+              </section>
+              <section class="card">
+                <h3>Regime Counts</h3>
+                <p>How often each regime occurred at rebalance dates.</p>
+                <div id="regime-counts-chart" class="plot plot-medium"></div>
+              </section>
+            </div>
+          </div>
+
+          <div id="tab-methodology" class="tab-panel">
+            <div class="card-grid two-up">
+              <section class="card">
+                <h3>Run Configuration</h3>
+                <dl id="methodology-config" class="meta-list"></dl>
+              </section>
+              <section class="card">
+                <h3>Assumptions & Sources</h3>
+                <ul class="bullet-list">
+                  <li>Universe is derived from the Wikipedia-based S&amp;P 500 membership table.</li>
+                  <li>Benchmark remains fixed as the S&amp;P 500 Index (<code>^GSPC</code>).</li>
+                  <li>Price data is sourced from Yahoo Finance.</li>
+                  <li>Sentiment views are built from a rolling news window and passed into the BL framework.</li>
+                  <li>Monthly rebalancing is kept static in this UI to stay aligned with the existing backtest logic.</li>
+                </ul>
+              </section>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="loading-overlay" class="loading-overlay hidden" aria-live="polite">
+      <div class="loading-card">
+        <div class="spinner"></div>
+        <div class="progress-track" aria-hidden="true">
+          <div id="loading-progress-bar" class="progress-bar"></div>
+        </div>
+        <h3>Running Backtest...</h3>
+        <p id="loading-message">Fetching market data...</p>
+        <p id="loading-eta" class="loading-meta">ETA: estimating...</p>
+        <p id="loading-elapsed" class="loading-meta">Elapsed: 0s</p>
+        <p class="loading-note">Full runs over 2015–2026 with all strategies can take several minutes, especially on the first pass while data and news caches are being refreshed.</p>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

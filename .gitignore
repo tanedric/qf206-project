@@ -9,6 +9,7 @@ venv/
 *.csv
 *.png
 *.pt
+!model/best_model.pt
 
 # VS Code
 .vscode/

@@ -23,6 +23,13 @@ import torch.nn as nn
 from dotenv import load_dotenv
 load_dotenv()
 
+# CHANGED: make script logging UTF-8-safe when Backtest.py is launched from the
+# dashboard subprocess on Windows, where cp1252 pipes can otherwise fail.
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 from sp500_wikipedia_universe import get_sp500_universe_for_date, ensure_membership_csv  # type: ignore[import]
 from data_pipeline import compute_indicators, get_seqs, z_score_norm  # type: ignore[import]
@@ -170,8 +177,11 @@ def classify_tickers(tickers, start_date, end_date):
     return active, ipo_map, delisted
 
 def main():
-    global START_DATE, END_DATE, ENABLE_MVO, ENABLE_BLACK_LITTERMAN, \
-           ENABLE_EQUAL_WEIGHT, ENABLE_LSTM_MVO, ENABLE_LSTM_BL
+    global START_DATE, END_DATE, SP500_GICS_FILTER, NEWS_LOOKBACK_DAYS, \
+           TRANSACTION_COST_BPS, TRANSACTION_COST, ENABLE_STRATEGIES, STRATEGIES, \
+           ENABLE_MVO, \
+           ENABLE_BLACK_LITTERMAN, ENABLE_EQUAL_WEIGHT, ENABLE_LSTM_MVO, \
+           ENABLE_LSTM_BL
 
     # ─────────────────────────────────────────────
     # ARGUMENT PARSING
@@ -186,6 +196,16 @@ def main():
                         help=f"Backtest end date   (default: {END_DATE})")
     parser.add_argument("--sector",   default=SP500_GICS_FILTER,   metavar="SECTOR",
                         help=f"S&P 500 sector to backtest (default: {SP500_GICS_FILTER})")
+    parser.add_argument(
+        "--sentiment-window-days", type=int, default=NEWS_LOOKBACK_DAYS,
+        metavar="DAYS",
+        help=f"Rolling news lookback window in days (default: {NEWS_LOOKBACK_DAYS})",
+    )
+    parser.add_argument(
+        "--transaction-cost-bps", type=float, default=TRANSACTION_COST_BPS,
+        metavar="BPS",
+        help=f"One-way transaction cost in basis points (default: {TRANSACTION_COST_BPS})",
+    )
     parser.add_argument(
         "--enable-strategies", nargs="+",
         metavar="STRATEGY",
@@ -212,6 +232,17 @@ def main():
     # Apply date overrides
     START_DATE = args.start
     END_DATE   = args.end
+    # CHANGED: dashboard/API can override the sector filter while preserving the
+    # existing Semiconductor default when no value is provided.
+    SP500_GICS_FILTER = (
+        None if str(args.sector).strip().lower() in {"", "all", "all s&p 500"}
+        else str(args.sector).strip()
+    )
+    # CHANGED: dashboard/API can override sentiment and trading-cost inputs;
+    # running Backtest.py directly still keeps the original defaults (15 days, 10 bps).
+    NEWS_LOOKBACK_DAYS = max(int(args.sentiment_window_days), 1)
+    TRANSACTION_COST_BPS = float(args.transaction_cost_bps)
+    TRANSACTION_COST = TRANSACTION_COST_BPS / 10_000
 
     # Apply strategy overrides
     _all_strategies = ["MVO", "Black-Litterman", "Equal_Weight", "LSTM_MVO", "LSTM_BL"]
@@ -239,6 +270,37 @@ def main():
     ENABLE_EQUAL_WEIGHT    = _strategy_flags["Equal_Weight"]
     ENABLE_LSTM_MVO        = _strategy_flags["LSTM_MVO"]
     ENABLE_LSTM_BL         = _strategy_flags["LSTM_BL"]
+    # CHANGED: refresh the global strategy lookup/list after CLI overrides so
+    # the dashboard-selected strategies are the only ones actually executed.
+    ENABLE_STRATEGIES = {
+        "MVO":               ENABLE_MVO,
+        "Black-Litterman":   ENABLE_BLACK_LITTERMAN,
+        "Equal_Weight":      ENABLE_EQUAL_WEIGHT,
+        "LSTM_MVO":          ENABLE_LSTM_MVO,
+        "LSTM_BL":           ENABLE_LSTM_BL,
+    }
+    STRATEGIES = [s for s, enabled in ENABLE_STRATEGIES.items() if enabled]
+
+    # CHANGED: print a simple upfront ETA in Backtest.py itself so both direct
+    # script runs and dashboard-triggered runs show the same estimate.
+    def _estimate_runtime_seconds():
+        start_ts = pd.to_datetime(START_DATE, errors="coerce")
+        end_ts = pd.to_datetime(END_DATE, errors="coerce")
+        if pd.isna(start_ts) or pd.isna(end_ts) or end_ts < start_ts:
+            months = 12
+        else:
+            months = max(1, ((end_ts.year - start_ts.year) * 12) + (end_ts.month - start_ts.month) + 1)
+        strategy_count = max(1, len(STRATEGIES))
+        has_lstm = any(s in {"LSTM_MVO", "LSTM_BL"} for s in STRATEGIES)
+        estimate = 60 + (months * 2.5) + (strategy_count * 35) + max(0, NEWS_LOOKBACK_DAYS - 15) * 1.2
+        if has_lstm:
+            estimate += 120
+        return max(estimate, 45.0)
+
+    def _format_duration(seconds):
+        total = max(0, int(round(seconds)))
+        mins, secs = divmod(total, 60)
+        return f"{mins}m {secs}s" if mins else f"{secs}s"
 
     # Clear cache if requested
     if args.clear_cache:
@@ -254,7 +316,11 @@ def main():
     print(f"── Configuration ───────────────────────────────────────────────────")
     print(f"  Start date : {START_DATE}")
     print(f"  End date   : {END_DATE}")
+    print(f"  Sector     : {SP500_GICS_FILTER or 'All S&P 500'}")
+    print(f"  Sentiment  : {NEWS_LOOKBACK_DAYS} day lookback")
+    print(f"  TC (bps)   : {TRANSACTION_COST_BPS}")
     print(f"  Strategies : { [s for s, v in _strategy_flags.items() if v] }")
+    print(f"  ETA        : ~{_format_duration(_estimate_runtime_seconds())}")
     print(f"  Clear cache: {args.clear_cache}\n")
 
     print("── S&P 500 membership CSV ──────────────────────────────────────────")
@@ -677,8 +743,12 @@ def main():
     # LSTM MODEL
     # ─────────────────────────────────────────────
     _MODEL_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-    _MODEL_PATH  = os.path.join(_MODEL_DIR, "best_model.pt")
-    _PARAM_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "param_dict.json")
+    # CHANGED: allow local environment overrides for model artifacts while
+    # preserving the original repo paths as defaults.
+    _MODEL_PATH  = os.getenv("BEST_MODEL_PATH") or os.path.join(_MODEL_DIR, "best_model.pt")
+    _PARAM_PATH  = os.getenv("PARAM_DICT_PATH") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "param_dict.json"
+    )
     _LSTM_SEQ_LEN = 9
     _N_FEATURES   = 12
 
