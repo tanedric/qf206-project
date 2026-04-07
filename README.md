@@ -202,52 +202,6 @@ Key examples:
 In the current results, the standard BL variant is the stronger and more robust benchmark.
 
 ---
-
-## About `best_model.pt`
-
-### Should I upload the `.pt` file?
-
-If you want the repo to run **out of the box**, then **yes**, uploading `model/best_model.pt` is reasonable here:
-
-- it is small
-- it is required for `LSTM_MVO` and `LSTM_BL`
-- the repo is much easier for others to reproduce when it is included
-
-This repo now allows that specific file to be tracked:
-
-- `model/best_model.pt`
-
-while still ignoring other generic `.pt` files.
-
-### If I do not upload it?
-
-Then:
-
-- `MVO`, `Black-Litterman`, and `Equal_Weight` can still run
-- but `LSTM_MVO` and `LSTM_BL` will fail unless the model file is present locally
-
----
-
-## Why PyTorch Is Still Needed
-
-Even though you are **not training** the LSTM anymore, you still need `torch` because the project performs **model inference**.
-
-PyTorch is used to:
-
-- define the LSTM model class
-- load the checkpoint from `best_model.pt`
-- build tensors for inference
-- run forward passes to generate predicted returns
-
-So:
-
-- training is not happening
-- but the `.pt` checkpoint still needs the PyTorch runtime to execute
-
-If you disable the LSTM strategies entirely, then the non-LSTM strategies do not conceptually need PyTorch, but the current codebase still imports it in `Backtest.py`.
-
----
-
 ## Recommended Workflow
 
 For the cleanest local usage:
