@@ -28,8 +28,18 @@ metrics/*.png
 
 # Large / raw data
 data/raw/*
-!data/raw/ticker_permno_map.csv
 
 # Local caches / rebuildable files
 data/news_cache.csv
 data/sentiment_cache.csv
+
+# Optional live-scoring / research pipeline
+live_ingestion/
+config/live_api.py
+config/feature_resolution.py
+config/paper_oap_mapping.py
+src/models/evaluation_metrics.py
+src/models/return_predictors.py
+src/data/train_preprocess.py
+scripts/run_live_backfill_and_score.py
+test.py
