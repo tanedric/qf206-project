@@ -2,24 +2,34 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
 .venv/
 venv/
+
 .env
-.DS_Store
-*.csv
-*.png
-*.pt
-!model/best_model.pt
 
-# VS Code
+# Editor / tooling
 .vscode/
-
-# Python cache
 .pytest_cache/
 .mypy_cache/
-
-# Jupyter
 .ipynb_checkpoints/
 
 # OS files
+.DS_Store
 Thumbs.db
+
+# Generated backtest outputs
+metrics/*.csv
+metrics/*.png
+
+# Model artifacts
+*.pt
+!model/best_model.pt
+
+# Large / raw data
+data/raw/*
+!data/raw/ticker_permno_map.csv
+
+# Local caches / rebuildable files
+data/news_cache.csv
+data/sentiment_cache.csv

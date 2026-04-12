@@ -49,6 +49,8 @@ API_KEY            = os.getenv("STOCKNEWS_API_KEY")
 START_DATE         = "2015-01-01"
 END_DATE           = "2026-01-01"
 REBALANCE_FREQ     = "ME"
+ESTIMATION_LOOKBACK_DAYS = 126
+PRESAMPLE_BUFFER_BDAYS   = 10
 
 # S&P 500 universe filter – matched case-insensitively against GICS Sector and
 # GICS Sub-Industry columns.  Set to None to use the full S&P 500.
@@ -337,6 +339,12 @@ def main():
         mins, secs = divmod(total, 60)
         return f"{mins}m {secs}s" if mins else f"{secs}s"
 
+    def _presample_start_date(start_date, lookback_days, buffer_bdays=PRESAMPLE_BUFFER_BDAYS):
+        """Download enough pre-start history to warm up the return estimators
+        without changing the reported/evaluated backtest window."""
+        start_ts = pd.Timestamp(start_date).normalize()
+        return (start_ts - pd.offsets.BDay(lookback_days + buffer_bdays)).strftime("%Y-%m-%d")
+
     # Clear cache if requested
     if args.clear_cache:
         _base = os.path.dirname(os.path.abspath(__file__))
@@ -351,6 +359,8 @@ def main():
     print(f"── Configuration ───────────────────────────────────────────────────")
     print(f"  Start date : {START_DATE}")
     print(f"  End date   : {END_DATE}")
+    data_start_date = _presample_start_date(START_DATE, ESTIMATION_LOOKBACK_DAYS)
+    print(f"  Data start : {data_start_date}  (burn-in for {ESTIMATION_LOOKBACK_DAYS}-day estimator)")
     print(f"  Sector     : {SP500_GICS_FILTER or 'All S&P 500'}")
     print(f"  Sentiment  : {NEWS_LOOKBACK_DAYS} day lookback")
     print(f"  TC (bps)   : {TRANSACTION_COST_BPS}")
@@ -400,7 +410,10 @@ def main():
 
     # CHANGED: one bulk universe download is now reused for both classification
     # and the later backtest price matrix.
-    raw_initial = silent_download(sp500_initial, START_DATE, END_DATE)
+    # CHANGED: pre-sample history is downloaded before the official backtest
+    # start so the first displayed/evaluated period already has a full
+    # estimation window available.
+    raw_initial = silent_download(sp500_initial, data_start_date, END_DATE)
     initial_prices = extract_price_frame(raw_initial, sp500_initial)
 
     print("── Ticker Classification ───────────────────────────────────────")
@@ -422,13 +435,16 @@ def main():
         if ticker in prices.columns:
             prices.loc[prices.index < ipo_date, ticker] = np.nan
 
-    returns       = prices.pct_change().replace([np.inf, -np.inf], np.nan)
-    returns.index = pd.DatetimeIndex(returns.index).tz_localize(None).normalize()
+    full_returns       = prices.pct_change().replace([np.inf, -np.inf], np.nan)
+    full_returns.index = pd.DatetimeIndex(full_returns.index).tz_localize(None).normalize()
+    evaluation_start_ts = pd.Timestamp(START_DATE).normalize()
+    evaluation_end_ts = pd.Timestamp(END_DATE).normalize()
+    returns = full_returns.loc[evaluation_start_ts:evaluation_end_ts].copy()
 
     benchmark_returns = pd.Series(dtype=float, name="benchmark")
     benchmark_equity  = pd.Series(dtype=float, name="benchmark_equity")
     try:
-        benchmark_raw = silent_download("^GSPC", START_DATE, END_DATE)
+        benchmark_raw = silent_download("^GSPC", data_start_date, END_DATE)
         if not benchmark_raw.empty:
             benchmark_prices = (
                 benchmark_raw["Adj Close"] if "Adj Close" in benchmark_raw.columns
@@ -439,12 +455,13 @@ def main():
             benchmark_prices.index = pd.DatetimeIndex(benchmark_prices.index).tz_localize(None).normalize()
             benchmark_prices = benchmark_prices.ffill()
             benchmark_returns = benchmark_prices.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+            benchmark_returns = benchmark_returns.loc[evaluation_start_ts:evaluation_end_ts]
             benchmark_equity = 100 * (1 + benchmark_returns.fillna(0.0)).cumprod()
     except Exception:
         benchmark_returns = pd.Series(dtype=float, name="benchmark")
         benchmark_equity  = pd.Series(dtype=float, name="benchmark_equity")
 
-    print(f"✓ Price data ready  |  {len(prices)} rows  |  universe: {all_valid_tickers}")
+    print(f"✓ Price data ready  |  {len(prices)} rows incl. burn-in ({data_start_date}→{END_DATE})  |  universe: {all_valid_tickers}")
 
     # ─────────────────────────────────────────────
     # REBALANCE DATES
@@ -1142,7 +1159,7 @@ def main():
         result = []
         for t in all_tickers:
             if t in ipo_map:
-                if returns.loc[:date, t].dropna().__len__() >= min_history:
+                if full_returns.loc[:date, t].dropna().__len__() >= min_history:
                     result.append(t)
             else:
                 result.append(t)
@@ -1206,11 +1223,14 @@ def main():
 
         if date in rebalance_dates and len(av_tick) > 1:
 
-            window_start = returns.index[max(0, i - 126)]
+            # CHANGED: estimate from the full return history (including the
+            # hidden pre-start burn-in), while still evaluating only from
+            # START_DATE onward.
             window = (
-                returns
-                .loc[window_start:date, av_tick]
+                full_returns
+                .loc[:date, av_tick]
                 .iloc[:-1]           # exclude today (not yet closed)
+                .tail(ESTIMATION_LOOKBACK_DAYS)
                 .dropna(axis=1)
             )
             live_tickers = list(window.columns)
@@ -1716,7 +1736,9 @@ def main():
     COLORS       = ["#2196F3", "#FF5722", "#4CAF50", "#9C27B0", "#FF9800"]
     STRAT_COLORS = dict(zip(STRATEGIES, COLORS))
 
-    active_strategies = [s for s in STRATEGIES if s != "Equal_Weight"]
+    # CHANGED: include Equal_Weight in Figure 6 so the weights figure covers
+    # every enabled strategy shown elsewhere in the report/dashboard.
+    active_strategies = list(STRATEGIES)
     TICKER_COLORS     = plt.cm.tab10(np.linspace(0, 0.9, len(all_valid_tickers)))
 
     def safe_plot(ax, series, **kwargs):
