@@ -18,8 +18,6 @@ from matplotlib.patches import Patch
 import os
 import sys
 import json
-import torch
-import torch.nn as nn
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -32,7 +30,6 @@ for _stream_name in ("stdout", "stderr"):
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 from sp500_wikipedia_universe import get_sp500_universe_for_date, ensure_membership_csv  # type: ignore[import]
-from data_pipeline import compute_indicators, get_seqs, z_score_norm  # type: ignore[import]
 
 
 # ─────────────────────────────────────────────
@@ -54,7 +51,7 @@ PRESAMPLE_BUFFER_BDAYS   = 10
 
 # S&P 500 universe filter – matched case-insensitively against GICS Sector and
 # GICS Sub-Industry columns.  Set to None to use the full S&P 500.
-SP500_GICS_FILTER  = "Semiconductor"
+SP500_GICS_FILTER  = "Technology"
 NEWS_LOOKBACK_DAYS = 15
 SENTIMENT_SCALING  = 0.3
 # Regime switch thresholds (average sentiment score: Positive=1, Neutral=0, Negative=-1)
@@ -71,8 +68,6 @@ MIN_HISTORY_DAYS   = 1
 ENABLE_MVO              = True
 ENABLE_BLACK_LITTERMAN  = True
 ENABLE_EQUAL_WEIGHT     = True
-ENABLE_LSTM_MVO         = True #True
-ENABLE_LSTM_BL          = True #True
 
 # ── TRANSACTION COSTS ─────────────────────────
 ENABLE_TRANSACTION_COSTS = True
@@ -130,9 +125,7 @@ FIG_WEIGHT = (36, 7)     # per-strategy weight chart (height multiplied by n_str
 ENABLE_STRATEGIES = {
     "MVO":               ENABLE_MVO,
     "Black-Litterman":   ENABLE_BLACK_LITTERMAN,
-    "Equal_Weight":      ENABLE_EQUAL_WEIGHT,
-    "LSTM_MVO":          ENABLE_LSTM_MVO,
-    "LSTM_BL":           ENABLE_LSTM_BL,
+    "Equal_Weight":      ENABLE_EQUAL_WEIGHT
 }
 STRATEGIES = [s for s, enabled in ENABLE_STRATEGIES.items() if enabled]
 
@@ -248,7 +241,7 @@ def main():
         metavar="STRATEGY",
         help=(
             "Whitelist of strategies to enable. All others are disabled.\n"
-            "Choices: MVO  Black-Litterman  Equal_Weight  LSTM_MVO  LSTM_BL\n"
+            "Choices: MVO  Black-Litterman  Equal_Weight \n"
             "Example: --enable-strategies MVO LSTM_MVO"
         ),
     )
@@ -286,9 +279,7 @@ def main():
     _strategy_flags = {
         "MVO":             ENABLE_MVO,
         "Black-Litterman": ENABLE_BLACK_LITTERMAN,
-        "Equal_Weight":    ENABLE_EQUAL_WEIGHT,
-        "LSTM_MVO":        ENABLE_LSTM_MVO,
-        "LSTM_BL":         ENABLE_LSTM_BL,
+        "Equal_Weight":    ENABLE_EQUAL_WEIGHT
     }
     if args.enable_strategies:
         unknown = set(args.enable_strategies) - set(_all_strategies)
@@ -305,16 +296,12 @@ def main():
     ENABLE_MVO             = _strategy_flags["MVO"]
     ENABLE_BLACK_LITTERMAN = _strategy_flags["Black-Litterman"]
     ENABLE_EQUAL_WEIGHT    = _strategy_flags["Equal_Weight"]
-    ENABLE_LSTM_MVO        = _strategy_flags["LSTM_MVO"]
-    ENABLE_LSTM_BL         = _strategy_flags["LSTM_BL"]
     # CHANGED: refresh the global strategy lookup/list after CLI overrides so
     # the dashboard-selected strategies are the only ones actually executed.
     ENABLE_STRATEGIES = {
         "MVO":               ENABLE_MVO,
         "Black-Litterman":   ENABLE_BLACK_LITTERMAN,
-        "Equal_Weight":      ENABLE_EQUAL_WEIGHT,
-        "LSTM_MVO":          ENABLE_LSTM_MVO,
-        "LSTM_BL":           ENABLE_LSTM_BL,
+        "Equal_Weight":      ENABLE_EQUAL_WEIGHT
     }
     STRATEGIES = [s for s, enabled in ENABLE_STRATEGIES.items() if enabled]
 
@@ -796,131 +783,6 @@ def main():
         print("\nMarket caps: skipped (Black-Litterman disabled)\n")
 
     # ─────────────────────────────────────────────
-    # LSTM MODEL
-    # ─────────────────────────────────────────────
-    _MODEL_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-    # CHANGED: allow local environment overrides for model artifacts while
-    # preserving the original repo paths as defaults.
-    _MODEL_PATH  = os.getenv("BEST_MODEL_PATH") or os.path.join(_MODEL_DIR, "best_model.pt")
-    _PARAM_PATH  = os.getenv("PARAM_DICT_PATH") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "param_dict.json"
-    )
-    _LSTM_SEQ_LEN = 9
-    _N_FEATURES   = 12
-
-    class _LSTMModel(nn.Module):
-        def __init__(self, input_size=12, hidden_size=64, num_layers=2, dropout=0.2):
-            super().__init__()
-            self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                                batch_first=True, dropout=dropout)
-            self.head = nn.Linear(hidden_size, 1)
-
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            return self.head(out[:, -1, :]).squeeze(-1)
-
-    _lstm_model = None
-    _lstm_param_dict = None
-
-    def _load_lstm():
-        nonlocal _lstm_model, _lstm_param_dict
-        if _lstm_model is not None:
-            return
-        checkpoint = torch.load(_MODEL_PATH, map_location="cpu", weights_only=False)
-        # Support both raw state-dict and checkpoint dicts
-        state_dict = checkpoint.get("model_state_dict", checkpoint) \
-            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint \
-            else checkpoint
-        cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-        hidden  = cfg.get("hidden_size",  64)
-        layers  = cfg.get("num_layers",   2)
-        dropout = cfg.get("dropout",      0.2)
-        model = _LSTMModel(_N_FEATURES, hidden, layers, dropout)
-        model.load_state_dict(state_dict)
-        model.eval()
-        _lstm_model = model
-        if os.path.exists(_PARAM_PATH):
-            with open(_PARAM_PATH) as f:
-                raw = json.load(f)
-            _lstm_param_dict = {k: tuple(v) for k, v in raw.items()}
-        print("✓ LSTM model loaded\n")
-
-    _indicator_cache: dict = {}  # keyed by (ticker, end_month_str) → pd.DataFrame
-
-    def predict_lstm_returns(tickers, as_of_date):
-        """Return a pd.Series of predicted monthly returns keyed by ticker.
-        Tickers with insufficient history are omitted.
-        Shared data (FF5, industry ETF, bulk prices) are fetched once per call."""
-        import data_pipeline as dp  # type: ignore[import]
-        _load_lstm()
-        preds = {}
-        end_str   = as_of_date.strftime("%Y-%m-%d")
-        # Need enough history for longest lookback (36m) + seq_len months
-        raw_start = (as_of_date - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
-
-        # ── Shared pre-fetches (once per rebalance) ────────────────────────────
-        ff5              = dp.fetch_ff5_factors(raw_start, end_str)
-        industry_returns = dp.fetch_industry_tracking_stock(raw_start, end_str)
-        market_returns   = dp.fetch_market_returns(raw_start, end_str) if ff5 is None else None
-
-        # Bulk price download for all tickers at once
-        bulk_prices = silent_download(tickers, raw_start, end_str)
-
-        for t in tickers:
-            try:
-                cache_key = (t, end_str)
-                if cache_key in _indicator_cache:
-                    df = _indicator_cache[cache_key]
-                else:
-                    # Extract this ticker's OHLCV from the bulk download
-                    if isinstance(bulk_prices.columns, pd.MultiIndex):
-                        try:
-                            daily_data = bulk_prices.xs(t, axis=1, level=1)
-                        except KeyError:
-                            print(f"     LSTM skip {t}: not in bulk download")
-                            continue
-                    else:
-                        daily_data = bulk_prices.copy()
-
-                    if daily_data.empty or len(daily_data) < 5:
-                        print(f"     LSTM skip {t}: insufficient price data")
-                        continue
-
-                    daily_data.index = pd.to_datetime(daily_data.index)
-                    daily_data = daily_data.sort_index()
-
-                    df = dp.compute_indicators(
-                        t,
-                        start_date=raw_start,
-                        end_date=end_str,
-                        daily_data=daily_data,
-                        ff5=ff5,
-                        industry_returns=industry_returns,
-                        market_returns=market_returns,
-                    )
-                    _indicator_cache[cache_key] = df
-
-                if _lstm_param_dict is not None:
-                    dp.param_dict = _lstm_param_dict
-                    feature_cols = [c for c in df.columns if c != "returns"]
-                    df = df.copy()
-                    df[feature_cols] = df[feature_cols].apply(dp.z_score_norm, axis=0)
-                seqs, _ = dp.get_seqs(df, seq_len=_LSTM_SEQ_LEN)
-                if not seqs:
-                    continue
-                x = torch.tensor(seqs[-1:], dtype=torch.float32)   # last sequence only
-                with torch.no_grad():
-                    pred = _lstm_model(x).item()
-                preds[t] = pred
-            except Exception as e:
-                print(f"     LSTM skip {t}: {e}")
-        return pd.Series(preds, dtype=float)
-
-    # Only load LSTM if either LSTM strategy is enabled
-    if ENABLE_STRATEGIES["LSTM_MVO"] or ENABLE_STRATEGIES["LSTM_BL"]:
-        _load_lstm()
-
-    # ─────────────────────────────────────────────
     # PORTFOLIO OPTIMISATION
     # ─────────────────────────────────────────────
     def max_sharpe_weights(mu, S, gamma_l2=0.1):
@@ -1361,43 +1223,6 @@ def main():
                     if ENABLE_STRATEGIES["Equal_Weight"]:
                         w["Equal_Weight"] = dict(
                             zip(live_tickers, np.full(n_live, 1 / n_live)))
-
-                    # ── LSTM predicted returns ─────────────────────────────────
-                    lstm_mu = None
-                    if ENABLE_STRATEGIES["LSTM_MVO"] or ENABLE_STRATEGIES["LSTM_BL"]:
-                        raw_preds = predict_lstm_returns(live_tickers, date)
-                        if len(raw_preds) >= 2:
-                            # Align to live_tickers; fall back to EMA mu for missing
-                            lstm_mu = mu.copy()
-                            for t in live_tickers:
-                                if t in raw_preds.index:
-                                    lstm_mu[t] = raw_preds[t]
-
-                    # ── LSTM MVO ──────────────────────────────────────────────
-                    if ENABLE_STRATEGIES["LSTM_MVO"] and lstm_mu is not None:
-                        w["LSTM_MVO"] = dict(zip(live_tickers,
-                                                 regime_weights(lstm_mu, S, regime)))
-                        prediction_snapshot["LSTM_MVO"] = (
-                            lstm_mu.reindex(live_tickers).astype(float).to_dict()
-                        )
-
-                    # ── LSTM Black-Litterman ───────────────────────────────────
-                    # Uses LSTM predictions as the prior (pi) in place of market-cap
-                    # implied returns; sentiment views (P/Q) are the same as BL above.
-                    if ENABLE_STRATEGIES["LSTM_BL"] and lstm_mu is not None:
-                        try:
-                            pi_lstm  = lstm_mu.reindex(live_tickers).fillna(
-                                lstm_mu.mean() if len(lstm_mu) else 0.0)
-                            raw_w_lb, ret_lstm_bl_signal = _bl_weights(
-                                pi_lstm, 1 / len(window), return_signal=True
-                            )
-                            if raw_w_lb is not None:
-                                w["LSTM_BL"] = dict(zip(live_tickers, raw_w_lb))
-                                prediction_snapshot["LSTM_BL"] = (
-                                    as_signal_series(ret_lstm_bl_signal, live_tickers).to_dict()
-                                )
-                        except Exception as e:
-                            print(f"     ⚠ LSTM_BL failed: {e}")
 
                     # ── Transaction costs & record ─────────────────────────────
                     # Apply costs to today's equity value (carry yesterday forward
